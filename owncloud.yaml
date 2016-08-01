@@ -1,0 +1,234 @@
+heat_template_version: 2013-05-23
+
+description: |
+  ####Single Linux server - RCv3
+  Single Linux server running [ownCloud](https://owncloud.org/).
+
+parameter_groups:
+
+- label: Server Settings
+  parameters:
+  - flavor
+  - image
+  - server_name
+- label: RackConnect Settings
+  parameters:
+  - rc_network_name
+- label: ownCloud Settings
+  parameters:
+  - owncloud_username
+
+parameters:
+
+  image:
+    label: Operating System
+    description: |
+      Server image used for all servers that are created as a part of this
+      deployment.
+    type: string
+    default: Ubuntu 14.04 LTS (Trusty Tahr) (PVHVM)
+    constraints:
+    - allowed_values:
+      - Ubuntu 14.04 LTS (Trusty Tahr) (PVHVM)
+      description: Must be a supported operating system.
+
+  server_name:
+    label: Server Hostname
+    description: The instance name
+    type: string
+    default: OwnCloud
+
+  flavor:
+    label: Server Size
+    description: |
+      Rackspace Cloud Server flavor to use. The size is based on the amount of
+      RAM for the provisioned server.
+    type: string
+    default: 2 GB General Purpose v1
+    constraints:
+    - allowed_values:
+      - 1 GB General Purpose v1
+      - 2 GB General Purpose v1
+      - 4 GB General Purpose v1
+      - 8 GB General Purpose v1
+      - 15 GB I/O v1
+      - 30 GB I/O v1
+      - 1GB Standard Instance
+      - 2GB Standard Instance
+      - 4GB Standard Instance
+      - 8GB Standard Instance
+      - 15GB Standard Instance
+      - 30GB Standard Instance
+      description: |
+        Must be a valid Rackspace Cloud Server flavor for the region you have
+        selected to deploy into.
+
+  owncloud_username:
+    label: Username
+    description: Username to use when logging into ownCloud
+    type: string
+    default: admin
+    constraints:
+    - allowed_pattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+      description: |
+        Must begin with a letter and contain only alphanumeric characters.
+
+  rc_network_name:
+    type: string
+    label: RackConnect Network
+    description: Name or UUID of RackConnected network to attach this server to
+    constraints:
+    - custom_constraint: rackconnect.network
+    immutable: true
+resources:
+
+  wait_condition:
+    type: OS::Heat::SwiftSignal
+    properties:
+      handle: { get_resource: wait_condition_handle }
+      timeout: 1800
+
+  wait_condition_handle:
+    type: OS::Heat::SwiftSignalHandle
+
+  # Password Generation
+  owncloud_password:
+    type: "OS::Heat::RandomString"
+    properties:
+      length: 16
+      sequence: lettersdigits
+
+  owncloud_db_password:
+    type: "OS::Heat::RandomString"
+    properties:
+      length: 16
+      sequence: lettersdigits
+
+  mysql_root_password:
+    type: "OS::Heat::RandomString"
+    properties:
+      length: 16
+      sequence: lettersdigits
+
+  # SSH key
+  ssh_key:
+    type: "OS::Nova::KeyPair"
+    properties:
+      name: { get_param: "OS::stack_id" }
+      save_private_key: true
+
+  owncloud_server:
+    type: "OS::Nova::Server"
+    properties:
+      name: { get_param: server_name }
+      flavor: { get_param: flavor }
+      image: { get_param: image }
+      key_name: { get_resource: ssh_key }
+      networks:
+      - network: { get_param: rc_network_name }
+      - network: 11111111-1111-1111-1111-111111111111
+      metadata:
+        rax-heat: { get_param: "OS::stack_id" }
+      config_drive: "true"
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #cloud-config
+            package_update: true
+            packages:
+              - git
+            write_files:
+            # Set salt-minion to only use local resources
+              - path: /etc/salt/minion.d/local.conf
+                permissions: '0644'
+                content: |
+                  file_client: local
+                  mysql.default_file: '/etc/mysql/debian.cnf'
+            # Write out Pillar top.sls
+              - path: /srv/pillar/top.sls
+                permissions: '0600'
+                content: |
+                  base:
+                    '*':
+                      - localhost
+            # Write out State top.sls
+              - path: /srv/salt/top.sls
+                permissions: '0644'
+                content: |
+                  base:
+                    '*':
+                      - salt-minion
+                      - apache
+                      - mysql
+                      - owncloud
+            # Example Pillar Data using %value% notation
+            # See example pillar data from states repository.
+              - path: /srv/pillar/localhost.sls
+                permissions: '0600'
+                content: |
+                  owncloud:
+                    username: %owncloud_username%
+                    password: %owncloud_password%
+                    db_password: %owncloud_db_password%
+                  mysql:
+                    root_password: %mysql_root_password%
+            # Salt Bootstrap script
+              - path: /tmp/heat/salt_run.sh
+                permissions: '0500'
+                content: |
+                  #!/bin/bash
+                  # Install salt-minion using Salt Bootstrap
+                  curl -L https://bootstrap.saltstack.com | sudo sh -s -- -P
+                  salt-minion --versions
+                  # Clone down States
+                  mkdir -p /tmp/heat/states
+                  git clone https://github.com/rackspace-orchestration-templates/salt-states.git /tmp/heat/states
+                  cp -nr /tmp/heat/states/* /srv/salt/
+                  # Run local highstate
+                  salt-call --local state.highstate
+                  # Open and Enable ufw
+                  ufw allow 443
+                  ufw allow 80
+                  ufw allow 22
+                  ufw --force enable
+                  wc_notify --data-binary '{"status": "SUCCESS"}'
+            runcmd:
+              - /tmp/heat/salt_run.sh
+          params:
+            wc_notify: { get_attr: ['wait_condition_handle', 'curl_cli'] }
+            "%owncloud_username%": { get_param: owncloud_username }
+            "%owncloud_password%": { get_attr: [owncloud_password, value] }
+            "%owncloud_db_password%": { get_attr: [owncloud_db_password, value] }
+            "%mysql_root_password%": { get_attr: [mysql_root_password, value] }
+
+  owncloud_server_public_ip:
+    type: Rackspace::RackConnect::PublicIP
+    depends_on: owncloud_server
+    properties:
+      server_id: { get_resource: owncloud_server }
+
+outputs:
+  private_key:
+    value: { get_attr: [ssh_key, private_key] }
+    description: "SSH Private Key"
+
+  server_ip:
+    value: { get_attr: [owncloud_server, accessIPv4] }
+    description: "Server IP"
+
+  owncloud_url:
+    value:
+      str_replace:
+        template: "https://%server_ip%/owncloud"
+        params:
+          "%server_ip%": { get_attr: [owncloud_server, accessIPv4] }
+    description: "ownCloud URL"
+
+  owncloud_username:
+    value: { get_param: owncloud_username }
+    description: "ownCloud Username"
+
+  owncloud_password:
+    value: { get_attr: [owncloud_password, value] }
+    description: "ownCloud Password"
